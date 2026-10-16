@@ -1,0 +1,404 @@
+name: Build Robot OS ISO (offline AI)
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: debian:bookworm
+      options: --privileged
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y live-build debootstrap ca-certificates curl xorriso squashfs-tools
+
+      - name: Configure the image (32-bit Debian for Acer Aspire One)
+        run: |
+          mkdir work && cd work
+          lb config \
+            --distribution bookworm \
+            --architectures i386 \
+            --linux-flavours 686 \
+            --archive-areas "main contrib non-free-firmware" \
+            --binary-images iso-hybrid \
+            --debian-installer none \
+            --apt-recommends false \
+            --memtest none \
+            --iso-volume ROBOT-OS \
+            --bootappend-live "boot=live components quiet"
+          mkdir -p config/package-lists
+          cat > config/package-lists/robot.list.chroot <<'PKG'
+          python3
+          espeak-ng
+          alsa-utils
+          network-manager
+          wpasupplicant
+          rfkill
+          ca-certificates
+          sudo
+          nano
+          ntfs-3g
+          util-linux
+          firmware-linux-free
+          firmware-atheros
+          firmware-brcm80211
+          firmware-realtek
+          firmware-iwlwifi
+          PKG
+
+      - name: Download the AI model (Qwen2.5 0.5B, about 400 MB)
+        run: |
+          mkdir -p work/config/includes.chroot/opt/robot
+          curl -fL --retry 3 -o work/config/includes.chroot/opt/robot/model.gguf \
+            https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          ls -lh work/config/includes.chroot/opt/robot/model.gguf
+
+      - name: Add the robot and the llama.cpp build step
+        run: |
+          cd work
+          I=config/includes.chroot
+          mkdir -p $I/opt/robot $I/etc/skel $I/etc/systemd/system/getty@tty1.service.d config/hooks/normal
+
+          cat > $I/opt/robot/robot.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Robo - a fully offline AI robot for old 32-bit PCs.
+          Brain: small local model served by llama.cpp (llama-server) on 127.0.0.1:8080.
+          Python standard library only."""
+          import json, os, re, subprocess, time, html, datetime
+          import urllib.request, urllib.parse
+
+          NAME = "Robo"
+          SERVER = "http://127.0.0.1:8080"
+          DATA = os.environ.get("ROBOT_DATA") or os.path.expanduser("~/robot")
+          os.makedirs(DATA, exist_ok=True)
+          MEM_FILE = os.path.join(DATA, "robot-memory.json")
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux i686) Gecko/20100101 Firefox/115.0"}
+
+          FACE = r"""
+             ._______.
+             | O   O |   {}
+             |   -   |
+             '-------'
+          """
+
+          # ---------------- memory: notes + habits ----------------
+          def load():
+              try:
+                  d = json.load(open(MEM_FILE))
+              except Exception:
+                  d = {}
+              d.setdefault("notes", [])
+              d.setdefault("hours", {})
+              return d
+
+          def save(d):
+              try:
+                  tmp = MEM_FILE + ".tmp"
+                  with open(tmp, "w") as f:
+                      json.dump(d, f, indent=1)
+                      f.flush()
+                      os.fsync(f.fileno())
+                  os.replace(tmp, MEM_FILE)
+              except Exception as e:
+                  print(f"(could not save memory: {e})")
+
+          def part_of_day(h):
+              if 5 <= h < 12: return "morning"
+              if 12 <= h < 17: return "afternoon"
+              if 17 <= h < 22: return "evening"
+              return "night"
+
+          HABIT = re.compile(
+              r"\b(my name is|call me|i like|i love|i enjoy|i hate|i prefer|i usually|i always|"
+              r"i never|i often|i work|i live|i study|my favou?rite|every (day|morning|night|evening|week|weekend)|"
+              r"i wake up|i go to bed)\b", re.I)
+
+          def add_note(d, text):
+              text = text.strip()
+              if text.lower() in [n["note"].lower() for n in d["notes"]]:
+                  return False
+              d["notes"].append({"date": datetime.date.today().isoformat(), "note": text})
+              d["notes"] = d["notes"][-60:]
+              save(d)
+              return True
+
+          def learn_from(d, text):
+              for s in re.split(r"(?<=[.!?])\s+", text):
+                  s = s.strip()
+                  if 4 < len(s) < 160 and HABIT.search(s):
+                      if add_note(d, s):
+                          return True
+              return False
+
+          # ---------------- web (done by the robot's code, not the model) ----------------
+          def fetch(url, data=None):
+              req = urllib.request.Request(url, data=data, headers=UA)
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return r.read(400000).decode("utf-8", "ignore")
+
+          def clean(t):
+              return html.unescape(re.sub(r"<[^>]+>", "", t)).strip()
+
+          def web_search(query):
+              page = fetch("https://html.duckduckgo.com/html/",
+                           urllib.parse.urlencode({"q": query}).encode())
+              links = re.findall(r'class="result__a" href="(.*?)">(.*?)</a>', page, re.S)
+              snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+              out = []
+              for i, (_, title) in enumerate(links[:4]):
+                  snip = clean(snips[i]) if i < len(snips) else ""
+                  out.append(f"- {clean(title)}: {snip}")
+              return "\n".join(out)[:1100]
+
+          SEARCH_CMD = re.compile(r"^(?:/search|search for|search|google|look up|lookup|find out)\s+(.+)", re.I)
+          NEEDS_WEB = re.compile(r"\b(latest|news|today|tonight|weather|price of|score|who won|right now|this week|currently)\b", re.I)
+
+          # ---------------- brain ----------------
+          def wait_server():
+              print("Loading my brain", end="", flush=True)
+              for _ in range(300):
+                  try:
+                      with urllib.request.urlopen(SERVER + "/health", timeout=3) as r:
+                          if r.status == 200:
+                              print(" ready!")
+                              return True
+                  except Exception:
+                      pass
+                  print(".", end="", flush=True)
+                  time.sleep(2)
+              print("\nMy brain did not start. Details are in /tmp/llama.log")
+              return False
+
+          def system_prompt(d):
+              notes = "; ".join(n["note"] for n in d["notes"][-12:]) or "nothing yet"
+              return (f"You are {NAME}, a friendly little robot living inside the user's old laptop. "
+                      "Answer in 1 to 3 short sentences, plain text, no lists. "
+                      "If you do not know something, say so. "
+                      f"What you know about the user: {notes}.")
+
+          def chat(messages):
+              body = json.dumps({"messages": messages, "stream": True, "max_tokens": 200,
+                                 "temperature": 0.7, "cache_prompt": True}).encode()
+              req = urllib.request.Request(SERVER + "/v1/chat/completions", body,
+                                           {"Content-Type": "application/json"})
+              out = []
+              with urllib.request.urlopen(req, timeout=900) as r:
+                  for raw in r:
+                      line = raw.decode("utf-8", "ignore").strip()
+                      if not line.startswith("data:"):
+                          continue
+                      payload = line[5:].strip()
+                      if payload == "[DONE]":
+                          break
+                      try:
+                          tok = json.loads(payload)["choices"][0]["delta"].get("content") or ""
+                      except Exception:
+                          continue
+                      print(tok, end="", flush=True)
+                      out.append(tok)
+              print()
+              return "".join(out).strip()
+
+          # ---------------- voice ----------------
+          voice_on = True
+          speaker = None
+          def say(text):
+              global speaker
+              if not voice_on or not text:
+                  return
+              try:
+                  if speaker and speaker.poll() is None:
+                      speaker.kill()
+                  speaker = subprocess.Popen(["espeak-ng", "-s", "150", text[:400]],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              except FileNotFoundError:
+                  pass
+
+          # ---------------- main ----------------
+          def main():
+              global voice_on
+              d = load()
+              h = datetime.datetime.now().hour
+              d["hours"][str(h)] = d["hours"].get(str(h), 0) + 1
+              save(d)
+
+              os.system("clear")
+              print(FACE.format(f"{NAME} online (offline brain)"))
+              print("Commands: /wifi  /voice  /memory  /forget  /quit")
+              print("Memory is saved in:", DATA, "\n")
+              if not wait_server():
+                  return
+
+              # greeting uses the habit it learned
+              buckets = {}
+              for hh, n in d["hours"].items():
+                  b = part_of_day(int(hh)); buckets[b] = buckets.get(b, 0) + n
+              greet = f"Good {part_of_day(h)}! I'm {NAME}. What are we up to?"
+              if sum(buckets.values()) >= 4:
+                  fav = max(buckets, key=buckets.get)
+                  greet = f"Good {part_of_day(h)}, welcome back! I've noticed you usually visit me in the {fav}."
+              print(f"\n{NAME}: {greet}\n")
+              say(greet)
+
+              history = []
+              while True:
+                  try:
+                      q = input("You: ").strip()
+                  except (EOFError, KeyboardInterrupt):
+                      break
+                  if not q:
+                      continue
+                  low = q.lower()
+                  if low in ("/quit", "/exit"):
+                      break
+                  if low == "/voice":
+                      voice_on = not voice_on
+                      print("Voice", "on" if voice_on else "off"); continue
+                  if low == "/wifi":
+                      subprocess.call(["nmtui"]); os.system("clear"); continue
+                  if low == "/memory":
+                      for n in d["notes"]:
+                          print(f"  {n['date']}  {n['note']}")
+                      if not d["notes"]:
+                          print("  (nothing yet)")
+                      continue
+                  if low == "/forget":
+                      d["notes"], d["hours"] = [], {}
+                      save(d); print("Memory wiped."); continue
+
+                  m = re.match(r"^(?:please\s+)?remember(?:\s+that)?\s+(.+)", q, re.I)
+                  if m:
+                      add_note(d, m.group(1))
+                      print(f"\n{NAME}: Okay, I'll remember that.\n"); say("Okay, I'll remember that.")
+                      continue
+                  if learn_from(d, q):
+                      print("  (noted)")
+
+                  # web: only when asked or when the question clearly needs fresh info
+                  question, context = q, ""
+                  sm = SEARCH_CMD.match(q)
+                  if sm or NEEDS_WEB.search(q):
+                      question = sm.group(1) if sm else q
+                      print("  [searching the web...]")
+                      try:
+                          context = web_search(question)
+                      except Exception:
+                          print(f"\n{NAME}: I can't reach the internet. Type /wifi to connect.\n")
+                          say("I can't reach the internet.")
+                          continue
+                  user_msg = (f"Web search results:\n{context}\n\nUsing these results, answer briefly: {question}"
+                              if context else q)
+
+                  msgs = [{"role": "system", "content": system_prompt(d)}] + history[-6:] + \
+                         [{"role": "user", "content": user_msg}]
+                  print(f"\n{NAME}: ", end="", flush=True)
+                  try:
+                      a = chat(msgs)
+                  except Exception as e:
+                      print(f"(brain error: {e})\n"); continue
+                  print()
+                  history += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+                  say(a)
+              print("Bye!")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > $I/opt/robot/start.sh <<'SHEOF'
+          #!/bin/bash
+          clear
+          echo "Robo is waking up..."
+          rfkill unblock all 2>/dev/null
+          amixer -q sset Master 90% unmute 2>/dev/null
+
+          # --- find a place to keep Robo's memory between boots (optional) ---
+          export ROBOT_DATA=""
+          LIVE=$(findmnt -n -o SOURCE /run/live/medium 2>/dev/null)
+          CANDS=$( { blkid -L ROBOTDATA 2>/dev/null; lsblk -rno NAME,RM,TYPE,FSTYPE | awk '$2==0 && $3=="part" && ($4=="ext4"||$4=="ext3"||$4=="ext2"||$4=="vfat"||$4=="ntfs"||$4=="exfat"){print "/dev/"$1}'; } )
+          sudo mkdir -p /mnt/robotdata
+          for d in $CANDS; do
+            [ "$d" = "$LIVE" ] && continue
+            if sudo mount -o rw "$d" /mnt/robotdata 2>/dev/null; then
+              sudo mkdir -p /mnt/robotdata/robot-data
+              sudo chown "$(id -u):$(id -g)" /mnt/robotdata/robot-data 2>/dev/null
+              if touch /mnt/robotdata/robot-data/.t 2>/dev/null; then
+                rm -f /mnt/robotdata/robot-data/.t
+                export ROBOT_DATA=/mnt/robotdata/robot-data
+                break
+              fi
+              sudo umount /mnt/robotdata
+            fi
+          done
+          [ -z "$ROBOT_DATA" ] && echo "(No writable disk found - memory will reset when you power off.)"
+
+          # --- start the brain ---
+          /opt/robot/llama-server -m /opt/robot/model.gguf -c 1536 -t 2 -np 1 \
+            --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
+
+          while true; do
+            python3 /opt/robot/robot.py
+            echo
+            read -p "Press Enter to restart Robo, or type off to shut down: " x
+            if [ "$x" = "off" ]; then sync; sudo poweroff; fi
+          done
+          SHEOF
+          chmod +x $I/opt/robot/start.sh
+
+          cat > config/hooks/normal/0100-llama.hook.chroot <<'HKEOF'
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates
+          apt-get install -y --no-install-recommends libstdc++6 libatomic1
+          cd /tmp
+          curl -fsSL https://github.com/ggml-org/llama.cpp/archive/refs/tags/b4500.tar.gz -o l.tgz
+          tar xzf l.tgz
+          cd llama.cpp-b4500
+          # Plain SSE3 build (no AVX etc.) so it runs on the Atom CPU in the Aspire One
+          FLAGS="-O3 -msse3 -mfpmath=sse"
+          linux32 cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_AVX512=OFF \
+            -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_AVX_VNNI=OFF -DGGML_BMI2=OFF \
+            -DGGML_SSE42=OFF -DGGML_LLAMAFILE=OFF -DGGML_OPENMP=OFF \
+            -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="-latomic"
+          linux32 cmake --build build -j"$(nproc)" --target llama-server
+          install -D -m755 build/bin/llama-server /opt/robot/llama-server
+          cd /
+          rm -rf /tmp/llama.cpp-b4500 /tmp/l.tgz
+          apt-get purge -y build-essential cmake curl
+          apt-get autoremove -y --purge
+          apt-get clean
+          HKEOF
+          chmod +x config/hooks/normal/0100-llama.hook.chroot
+
+          cat > $I/etc/skel/.bash_profile <<'BPEOF'
+          if [ "$(tty)" = "/dev/tty1" ]; then
+            exec /opt/robot/start.sh
+          fi
+          BPEOF
+
+          cat > $I/etc/systemd/system/getty@tty1.service.d/autologin.conf <<'AGEOF'
+          [Service]
+          ExecStart=
+          ExecStart=-/sbin/agetty --autologin user --noclear %I $TERM
+          AGEOF
+
+      - name: Build the ISO
+        run: |
+          cd work
+          lb build
+          ls -lh *.iso
+          mv *.iso ../robot-os.iso
+
+      - name: Publish ISO
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: iso-${{ github.run_number }}
+          name: Robot OS ISO ${{ github.run_number }}
+          files: robot-os.iso
